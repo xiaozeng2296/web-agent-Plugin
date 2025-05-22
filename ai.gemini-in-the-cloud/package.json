@@ -1,0 +1,12 @@
+{
+  "name": "电商助手",
+  "version": "1.0",
+  "scripts": {
+    "build": "rollup sidepanel/index.js --file dist/sidepanel.bundle.js --format iife"
+  },
+  "private": true,
+  "devDependencies": {
+    "@google/generative-ai": "0.15.0",
+    "rollup": "4.22.4"
+  }
+}
