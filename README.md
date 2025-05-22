@@ -112,6 +112,11 @@ copy .env.example .env
 cp .env.example .env
 ```
 Edit `.env` with your preferred text editor and add your API keys
+启动之后：如何需要无法使用自己本身的浏览器
+使用下面命令启动一个chrome：  端口号和env里面配置的cdp端口保持一致 CHROME_CDP=http://localhost:9001
+
+启动后可以在其他浏览器访问，确保能获取启动后浏览器的基本信息
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9001 --user-data-dir=~/chromefile_web_agent
 
 3. Run with Docker:
 ```bash
