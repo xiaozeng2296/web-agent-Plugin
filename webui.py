@@ -1,49 +1,304 @@
-import pdb
 import logging
 
 from dotenv import load_dotenv
 
+from src.utils.deep_research import deep_research
+
 load_dotenv()
-import os
 import glob
 import asyncio
 import argparse
 import os
+from datetime import datetime, timedelta
+
+# 导入APScheduler相关模块
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 import gradio as gr
-import inspect
-from functools import wraps
 
 from browser_use.agent.service import Agent
-from playwright.async_api import async_playwright
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import (
-    BrowserContextConfig,
     BrowserContextWindowSize,
 )
-from langchain_ollama import ChatOllama
-from playwright.async_api import async_playwright
 from src.utils.agent_state import AgentState
 
-from src.utils import utils
 from src.agent.custom_agent import CustomAgent
 from src.browser.custom_browser import CustomBrowser
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
-from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
+from src.browser.custom_context import BrowserContextConfig
 from src.controller.custom_controller import CustomController
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot, MissingAPIKeyError
 from src.utils import utils
+from src.utils.dingding_utils import DingTalkRobot
+from src.utils.app_state import app_state
 
-# Global variables for persistence
-_global_browser = None
-_global_browser_context = None
-_global_agent = None
+# 注意：全局变量已被移至 app_state 单例管理，请使用 app_state 提供的方法访问
+# 可通过 app_state.get_browser(), app_state.get_agent(), app_state.get_scheduler() 等方法访问资源
 
-# Create the global agent state instance
-_global_agent_state = AgentState()
+# 调度器关闭钩子函数
+def shutdown_scheduler():
+    """
+    在程序退出时关闭调度器
+    """
+    scheduler = app_state.get_scheduler()
+    if scheduler and scheduler.running:
+        logger.info("程序退出，关闭调度器")
+        scheduler.shutdown(wait=False)
+
+# 注册退出钩子
+import atexit
+atexit.register(shutdown_scheduler)
+
+def start_scheduler(research_task, interval_hours=1, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    启动定时推送调度器
+    
+    参数:
+        research_task: 研究任务内容
+        interval_hours: 执行间隔小时数
+        title_prefix: 推送消息标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+    
+    返回:
+        启动结果消息
+    """
+    try:
+        # 获取当前调度器状态
+        scheduler = app_state.get_scheduler()
+        if scheduler and scheduler.running:
+            logger.info("调度器已经在运行中，正在重置...")
+            scheduler.shutdown(wait=False)
+        
+        executor = ThreadPoolExecutor(max_workers=1)
+        new_scheduler = BackgroundScheduler(executors={'default': executor})
+        app_state.set_scheduler(new_scheduler)
+        
+        interval = max(1/60, interval_hours)
+        trigger = IntervalTrigger(hours=interval)
+        
+        job_args = {
+            'research_task': research_task,
+            'title_prefix': title_prefix,
+            'search_iterations': search_iterations,
+            'query_per_iter': query_per_iter
+        }
+        
+        new_scheduler.add_job(
+            scheduled_job, 
+            trigger=trigger,
+            kwargs=job_args,
+            id='deep_research_job',
+            replace_existing=True,
+            misfire_grace_time=600
+        )
+        
+        new_scheduler.start()
+        
+        # 更新调度器状态
+        scheduler_status = {
+            "running": True,
+            "next_run_time": datetime.now() + timedelta(hours=interval),
+            "interval_hours": interval
+        }
+        app_state.update_scheduler_status(scheduler_status)
+        
+        success_msg = f"调度器已成功启动，将每 {interval} 小时执行一次"  
+        if interval < 1:
+            minutes = int(interval * 60)
+            success_msg = f"调度器已成功启动，将每 {minutes} 分钟执行一次"
+            
+        logger.info(f"调度器启动成功: {success_msg}")
+        return success_msg
+    
+    except Exception as e:
+        error_msg = f"启动调度器失败: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+def stop_scheduler():
+    """
+    停止定时推送调度器
+    
+    返回:
+        停止结果消息
+    """
+    try:
+        scheduler = app_state.get_scheduler()
+        if scheduler and scheduler.running:
+            scheduler.shutdown(wait=False)
+            app_state.set_scheduler(None)
+            
+            # 更新调度器状态
+            scheduler_status = {
+                "running": False,
+                "next_run_time": None
+            }
+            app_state.update_scheduler_status(scheduler_status)
+            
+            logger.info("调度器已停止")
+            return "调度器已成功停止"
+        else:
+            return "调度器已经处于停止状态"
+    
+    except Exception as e:
+        error_msg = f"停止调度器失败: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+# 立即执行一次推送任务
+def run_push_task_once(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    立即执行一次推送任务，不启动调度器
+    
+    参数:
+        research_task: 研究任务内容
+        title_prefix: 推送消息标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+    
+    返回:
+        tuple: (结果消息, 状态文本, 下次执行时间文本)
+    """
+    try:
+        # 调用定时任务入口函数
+        result = scheduled_job(research_task, title_prefix, search_iterations, query_per_iter)
+        
+        # 更新最后一次状态
+        _scheduler_status["last_status"] = "手动执行完成"
+        
+        # 生成返回值
+        status_text = "调度器状态: " + ("运行中" if _scheduler_status.get("running", False) else "未启动")
+        next_run = _scheduler_status.get("next_run_time")
+        next_run_text = "下次执行时间: " + (next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "无排程")
+        
+        return f"执行成功: {result}", status_text, next_run_text
+    except Exception as e:
+        error_msg = f"执行失败: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg, "调度器状态: 错误", "下次执行时间: 未知"
+
+async def execute_push_task(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    执行深度研究并将结果推送到钉钉
+    
+    参数:
+        research_task: 研究任务内容
+        title_prefix: 推送消息标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数
+    
+    返回:
+        执行结果消息
+    """
+    global _scheduler_status
+    
+    try:
+        # 记录开始时间
+        start_time = datetime.now()
+        logger.info(f"开始执行定时推送任务，时间：{start_time}，任务：{research_task}")
+        
+        # 更新执行状态
+        _scheduler_status["last_run_time"] = start_time
+        _scheduler_status["last_status"] = "运行中"
+        
+        # 创建代理状态
+        agent_state = AgentState()
+        agent_state.clear_stop()
+        
+        # 获取LLM模型
+        llm = utils.get_llm_model(
+            provider=os.getenv("OPENAI_API_TYPE", "openai"),
+            model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo"),
+            num_ctx=int(os.getenv("OPENAI_CTX_SIZE", "4096")),
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
+            base_url=os.getenv("OPENAI_API_BASE", None),
+            api_key=os.getenv("OPENAI_API_KEY", None),
+        )
+        
+        # 执行深度研究
+        logger.info(f"开始执行深度研究: {research_task}")
+        markdown_content, file_path = await deep_research(
+            research_task, 
+            llm, 
+            agent_state,
+            max_search_iterations=search_iterations,
+            max_query_num=query_per_iter,
+            use_vision=True,
+            headless=True,
+            use_own_browser=False
+        )
+        
+        # 计算执行时间
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        duration_str = f"{duration:.2f}秒" if duration < 60 else f"{duration/60:.2f}分钟"
+        
+        # 准备推送内容
+        if markdown_content:
+            # 标题包含任务简述和执行时间
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            title = f"{title_prefix}: {research_task[:20]}..." if len(research_task) > 20 else f"{title_prefix}: {research_task}"
+            
+            # 消息头部添加执行信息
+            message_header = f"## {title}\n\n"
+            message_header += f"**执行时间**: {current_time}\n\n"
+            message_header += f"**耗时**: {duration_str}\n\n"
+            message_header += f"**任务**: {research_task}\n\n"
+            message_header += "---\n\n"
+            
+            # 拼接内容，钉钉限制消息长度，超长时需要截断
+            message = message_header + markdown_content
+            if len(message) > 20000:  # 钉钉消息长度限制
+                message = message[:19700] + "\n\n...(内容已截断，完整内容请查看生成的文件)"
+            
+            # 发送到钉钉
+            logger.info(f"发送研究结果到钉钉，标题: {title}, 内容长度: {len(message)}")
+            try:
+                send_result = DingTalkRobot.send_markdown(title, message)
+                if send_result:
+                    result_msg = f"任务执行成功并推送至钉钉，耗时: {duration_str}"
+                    logger.info(result_msg)
+                    # 更新状态
+                    _scheduler_status["last_status"] = "执行成功"
+                else:
+                    result_msg = f"任务执行成功但钉钉推送失败，耗时: {duration_str}"
+                    logger.error(result_msg)
+                    _scheduler_status["last_status"] = "推送失败"
+            except Exception as e:
+                result_msg = f"钉钉推送失败: {str(e)}"
+                logger.error(result_msg, exc_info=True)
+                _scheduler_status["last_status"] = "推送异常"
+        else:
+            result_msg = "任务执行失败，未获得研究结果"
+            logger.warning(result_msg)
+            _scheduler_status["last_status"] = "执行失败"
+        
+        return result_msg, markdown_content, file_path
+    
+    except Exception as e:
+        error_msg = f"定时任务执行异常: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        _scheduler_status["last_status"] = f"执行异常: {str(e)[:50]}"
+        
+        # 发送错误通知到钉钉
+        try:
+            error_title = "深度研究任务执行异常"
+            error_content = f"## 深度研究任务执行异常\n\n"
+            error_content += f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            error_content += f"**任务**: {research_task}\n\n"
+            error_content += f"**错误**: {str(e)}\n\n"
+            DingTalkRobot.send_markdown(error_title, error_content)
+        except Exception as send_error:
+            logger.error(f"发送错误通知失败: {str(send_error)}")
+        
+        return error_msg, None, None
 
 # webui config
 webui_config_manager = utils.ConfigManager()
@@ -114,14 +369,74 @@ def resolve_sensitive_env_variables(text):
     return result
 
 
+def scheduled_job(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    定时任务入口函数
+    使用asyncio运行异步深度研究任务并将结果推送到钉钉
+    
+    参数:
+        research_task: 研究任务内容
+        title_prefix: 消息标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+    """
+    try:
+        # 记录任务触发
+        logger.info(f"定时任务触发，研究任务: {research_task}")
+        
+        # 创建新的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # 定义任务超时时间，防止任务长时间运行
+            result = loop.run_until_complete(
+                asyncio.wait_for(
+                    execute_push_task(research_task, title_prefix, search_iterations, query_per_iter),
+                    timeout=3600  # 设置1小时超时时间
+                )
+            )
+            return result
+        except asyncio.TimeoutError:
+            error_msg = "任务执行超时"
+            logger.error(error_msg)
+            
+            # 尝试发送超时通知
+            try:
+                error_title = "深度研究任务超时"
+                error_content = f"## 深度研究任务超时\n\n"
+                error_content += f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                error_content += f"**任务**: {research_task}\n\n"
+                error_content += f"**原因**: 任务执行时间超过1小时被自动终止\n\n"
+                DingTalkRobot.send_markdown(error_title, error_content)
+            except Exception as send_error:
+                logger.error(f"发送超时通知失败: {str(send_error)}")
+                
+            return error_msg, None, None
+        finally:
+            # 关闭事件循环
+            try:
+                # 取消所有未完成的任务
+                for task in asyncio.all_tasks(loop):
+                    task.cancel()
+                    
+                # 等待任务取消完成
+                loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
+                loop.close()
+            except Exception as close_error:
+                logger.error(f"关闭事件循环失败: {str(close_error)}")
+    except Exception as e:
+        logger.error(f"定时任务入口函数异常: {str(e)}", exc_info=True)
+        return f"任务异常: {str(e)}", None, None
+
+
 async def stop_agent():
     """Request the agent to stop and update UI with enhanced feedback"""
-    global _global_agent
-
     try:
-        if _global_agent is not None:
+        agent = app_state.get_agent()
+        if agent is not None:
             # Request stop
-            _global_agent.stop()
+            agent.stop()
         # Update UI immediately
         message = "Stop requested - the agent will halt at the next safe point"
         logger.info(f"🛑 {message}")
@@ -141,24 +456,22 @@ async def stop_agent():
 
 
 async def stop_research_agent():
-    """Request the agent to stop and update UI with enhanced feedback"""
-    global _global_agent_state
-
+    """Request the research agent to stop and update UI with feedback"""
     try:
-        # Request stop
-        _global_agent_state.request_stop()
-
-        # Update UI immediately
-        message = "Stop requested - the agent will halt at the next safe point"
+        # 获取代理状态实例并发送停止请求
+        agent_state = app_state.get_agent_state()
+        agent_state.request_stop()
+        
+        message = "研究代理停止请求已发送，将在下一个安全点停止"
         logger.info(f"🛑 {message}")
-
-        # Return UI updates
-        return (  # errors_output
-            gr.update(value="Stopping...", interactive=False),  # stop_button
+        
+        # 返回UI更新
+        return (
+            gr.update(value="正在停止...", interactive=False),  # stop_button
             gr.update(interactive=False),  # run_button
         )
     except Exception as e:
-        error_msg = f"Error during stop: {str(e)}"
+        error_msg = f"停止代理时出错: {str(e)}"
         logger.error(error_msg)
         return (
             gr.update(value="Stop", interactive=True),
@@ -329,13 +642,47 @@ async def run_org_agent(
         chrome_cdp,
         max_input_tokens
 ):
+    """运行标准浏览器代理
+    
+    使用 AppState 单例管理浏览器和代理实例的生命周期，确保资源正确分配和释放
+    
+    参数:
+        llm: 语言模型实例
+        use_own_browser: 是否使用用户自己的浏览器
+        keep_browser_open: 任务完成后是否保持浏览器打开状态
+        headless: 是否使用无头模式运行浏览器
+        disable_security: 是否禁用浏览器安全特性
+        window_w: 浏览器窗口宽度
+        window_h: 浏览器窗口高度
+        save_recording_path: 录制视频保存路径
+        save_agent_history_path: 代理历史记录保存路径
+        save_trace_path: Trace文件保存路径
+        task: 代理任务描述
+        max_steps: 最大执行步数
+        use_vision: 是否使用视觉功能
+        max_actions_per_step: 每步最大动作数
+        tool_calling_method: 工具调用方式
+        chrome_cdp: Chrome浏览器调试协议URL
+        max_input_tokens: 最大输入令牌数
+    
+    返回:
+        final_result: 最终执行结果
+        errors: 错误信息
+        model_actions: 模型执行动作
+        model_thoughts: 模型思考过程
+        trace_file: Trace文件路径
+        history_file: 历史文件路径
+    """
+    start_time = datetime.now()
+    logger.info(f"开始运行标准代理任务: {task[:50]}...")
+    
     try:
-        global _global_browser, _global_browser_context, _global_agent
-
+        # 准备浏览器配置
         extra_chromium_args = ["--accept_downloads=True", f"--window-size={window_w},{window_h}"]
         cdp_url = chrome_cdp
 
         if use_own_browser:
+            # 使用用户自己的浏览器配置
             cdp_url = os.getenv("CHROME_CDP", chrome_cdp)
             chrome_path = os.getenv("CHROME_PATH", None)
             if chrome_path == "":
@@ -346,8 +693,11 @@ async def run_org_agent(
         else:
             chrome_path = None
 
-        if _global_browser is None:
-            _global_browser = Browser(
+        # 获取或创建浏览器实例
+        browser = app_state.get_browser()
+        if browser is None:
+            logger.info("创建新的浏览器实例")
+            browser = Browser(
                 config=BrowserConfig(
                     headless=headless,
                     cdp_url=cdp_url,
@@ -356,9 +706,13 @@ async def run_org_agent(
                     extra_chromium_args=extra_chromium_args,
                 )
             )
+            app_state.set_browser(browser)
 
-        if _global_browser_context is None:
-            _global_browser_context = await _global_browser.new_context(
+        # 获取或创建浏览器上下文
+        browser_context = app_state.get_browser_context()
+        if browser_context is None:
+            logger.info("创建新的浏览器上下文")
+            browser_context = await browser.new_context(
                 config=BrowserContextConfig(
                     trace_path=save_trace_path if save_trace_path else None,
                     save_recording_path=save_recording_path if save_recording_path else None,
@@ -369,48 +723,70 @@ async def run_org_agent(
                     ),
                 )
             )
+            app_state.set_browser_context(browser_context)
 
-        if _global_agent is None:
-            _global_agent = Agent(
+        # 获取或创建代理实例
+        agent = app_state.get_agent()
+        if agent is None:
+            logger.info("创建新的代理实例")
+            agent = Agent(
                 task=task,
                 llm=llm,
                 use_vision=use_vision,
-                browser=_global_browser,
-                browser_context=_global_browser_context,
+                browser=browser,
+                browser_context=browser_context,
                 max_actions_per_step=max_actions_per_step,
                 tool_calling_method=tool_calling_method,
                 max_input_tokens=max_input_tokens,
                 generate_gif=True
             )
-        history = await _global_agent.run(max_steps=max_steps)
+            app_state.set_agent(agent)
+            
+        # 运行代理任务
+        logger.info(f"开始执行代理任务，最大步数: {max_steps}")
+        history = await agent.run(max_steps=max_steps)
 
-        history_file = os.path.join(save_agent_history_path, f"{_global_agent.state.agent_id}.json")
-        _global_agent.save_history(history_file)
+        # 保存历史记录
+        history_file = os.path.join(save_agent_history_path, f"{agent.state.agent_id}.json")
+        agent.save_history(history_file)
+        logger.info(f"代理历史已保存至: {history_file}")
 
+        # 提取结果
         final_result = history.final_result()
         errors = history.errors()
         model_actions = history.model_actions()
         model_thoughts = history.model_thoughts()
 
+        # 获取最新的trace文件
         trace_file = get_latest_files(save_trace_path)
+        
+        # 记录执行耗时
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"代理任务执行完成，耗时: {execution_time:.2f}秒")
 
         return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        errors = str(e) + "\n" + traceback.format_exc()
+        error_details = traceback.format_exc()
+        logger.error(f"代理任务执行失败: {str(e)}\n{error_details}")
+        errors = str(e) + "\n" + error_details
         return '', errors, '', '', None, None
     finally:
-        _global_agent = None
-        # Handle cleanup based on persistence configuration
+        # 清理代理实例
+        app_state.set_agent(None)
+        
+        # 根据配置决定是否保持浏览器打开
         if not keep_browser_open:
-            if _global_browser_context:
-                await _global_browser_context.close()
-                _global_browser_context = None
+            logger.info("关闭浏览器资源")
+            browser_context = app_state.get_browser_context()
+            if browser_context:
+                await browser_context.close()
+                app_state.set_browser_context(None)
 
-            if _global_browser:
-                await _global_browser.close()
-                _global_browser = None
+            browser = app_state.get_browser()
+            if browser:
+                await browser.close()
+                app_state.set_browser(None)
 
 
 async def run_custom_agent(
@@ -433,9 +809,43 @@ async def run_custom_agent(
         chrome_cdp,
         max_input_tokens
 ):
+    """运行自定义浏览器代理
+    
+    使用 AppState 单例管理浏览器和代理实例的生命周期，确保资源正确分配和释放
+    
+    参数:
+        llm: 语言模型实例
+        use_own_browser: 是否使用用户自己的浏览器
+        keep_browser_open: 任务完成后是否保持浏览器打开状态
+        headless: 是否使用无头模式运行浏览器
+        disable_security: 是否禁用浏览器安全特性
+        window_w: 浏览器窗口宽度
+        window_h: 浏览器窗口高度
+        save_recording_path: 录制视频保存路径
+        save_agent_history_path: 代理历史记录保存路径
+        save_trace_path: Trace文件保存路径
+        task: 代理任务描述
+        add_infos: 附加信息
+        max_steps: 最大执行步数
+        use_vision: 是否使用视觉功能
+        max_actions_per_step: 每步最大动作数
+        tool_calling_method: 工具调用方式
+        chrome_cdp: Chrome浏览器调试协议URL
+        max_input_tokens: 最大输入令牌数
+    
+    返回:
+        final_result: 最终执行结果
+        errors: 错误信息
+        model_actions: 模型执行动作
+        model_thoughts: 模型思考过程
+        trace_file: Trace文件路径
+        history_file: 历史文件路径
+    """
+    start_time = datetime.now()
+    logger.info(f"开始运行自定义代理任务: {task[:50]}...")
+    
     try:
-        global _global_browser, _global_browser_context, _global_agent
-
+        # 准备浏览器配置
         extra_chromium_args = ["--accept_downloads=True", f"--window-size={window_w},{window_h}"]
         cdp_url = chrome_cdp
         if use_own_browser:
@@ -452,10 +862,14 @@ async def run_custom_agent(
 
         controller = CustomController()
 
-        # Initialize global browser if needed
-        # if chrome_cdp not empty string nor None
-        if (_global_browser is None) or (cdp_url and cdp_url != "" and cdp_url != None):
-            _global_browser = CustomBrowser(
+        # 获取或创建自定义浏览器实例
+        browser = app_state.get_browser()
+        cdp_condition = cdp_url and cdp_url != "" and cdp_url != None
+        
+        # 如果没有浏览器实例或CDP URL发生变化，则创建新实例
+        if (browser is None) or cdp_condition:
+            logger.info("创建新的自定义浏览器实例")
+            browser = CustomBrowser(
                 config=BrowserConfig(
                     headless=headless,
                     disable_security=disable_security,
@@ -464,9 +878,13 @@ async def run_custom_agent(
                     extra_chromium_args=extra_chromium_args,
                 )
             )
+            app_state.set_browser(browser)
 
-        if _global_browser_context is None or (chrome_cdp and cdp_url != "" and cdp_url != None):
-            _global_browser_context = await _global_browser.new_context(
+        # 获取或创建浏览器上下文
+        browser_context = app_state.get_browser_context()
+        if browser_context is None or cdp_condition:
+            logger.info("创建新的自定义浏览器上下文")
+            browser_context = await browser.new_context(
                 config=BrowserContextConfig(
                     trace_path=save_trace_path if save_trace_path else None,
                     save_recording_path=save_recording_path if save_recording_path else None,
@@ -477,16 +895,19 @@ async def run_custom_agent(
                     ),
                 )
             )
+            app_state.set_browser_context(browser_context)
 
-        # Create and run agent
-        if _global_agent is None:
-            _global_agent = CustomAgent(
+        # 创建和运行代理实例
+        agent = app_state.get_agent()
+        if agent is None:
+            logger.info("创建新的自定义代理实例")
+            agent = CustomAgent(
                 task=task,
                 add_infos=add_infos,
                 use_vision=use_vision,
                 llm=llm,
-                browser=_global_browser,
-                browser_context=_global_browser_context,
+                browser=browser,
+                browser_context=browser_context,
                 controller=controller,
                 system_prompt_class=CustomSystemPrompt,
                 agent_prompt_class=CustomAgentMessagePrompt,
@@ -495,35 +916,53 @@ async def run_custom_agent(
                 max_input_tokens=max_input_tokens,
                 generate_gif=True
             )
-        history = await _global_agent.run(max_steps=max_steps)
+            app_state.set_agent(agent)
+            
+        # 运行代理任务
+        logger.info(f"开始执行自定义代理任务，最大步数: {max_steps}")
+        history = await agent.run(max_steps=max_steps)
 
-        history_file = os.path.join(save_agent_history_path, f"{_global_agent.state.agent_id}.json")
-        _global_agent.save_history(history_file)
+        # 保存代理历史
+        history_file = os.path.join(save_agent_history_path, f"{agent.state.agent_id}.json")
+        agent.save_history(history_file)
+        logger.info(f"代理历史已保存至: {history_file}")
 
+        # 提取结果
         final_result = history.final_result()
         errors = history.errors()
         model_actions = history.model_actions()
         model_thoughts = history.model_thoughts()
 
+        # 获取最新的trace文件
         trace_file = get_latest_files(save_trace_path)
+        
+        # 记录执行耗时
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"自定义代理任务执行完成，耗时: {execution_time:.2f}秒")
 
         return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        errors = str(e) + "\n" + traceback.format_exc()
+        error_details = traceback.format_exc()
+        logger.error(f"自定义代理任务执行失败: {str(e)}\n{error_details}")
+        errors = str(e) + "\n" + error_details
         return '', errors, '', '', None, None
     finally:
-        _global_agent = None
-        # Handle cleanup based on persistence configuration
+        # 清理代理实例
+        app_state.set_agent(None)
+        
+        # 根据配置决定是否保持浏览器打开
         if not keep_browser_open:
-            if _global_browser_context:
-                await _global_browser_context.close()
-                _global_browser_context = None
+            logger.info("关闭浏览器资源")
+            browser_context = app_state.get_browser_context()
+            if browser_context:
+                await browser_context.close()
+                app_state.set_browser_context(None)
 
-            if _global_browser:
-                await _global_browser.close()
-                _global_browser = None
+            browser = app_state.get_browser()
+            if browser:
+                await browser.close()
+                app_state.set_browser(None)
 
 
 async def run_with_stream(
@@ -553,7 +992,11 @@ async def run_with_stream(
         chrome_cdp,
         max_input_tokens
 ):
-    global _global_agent
+    """带流式更新的代理运行方法
+    
+    使用 AppState 单例管理浏览器和代理实例的生命周期，提供实时屏幕更新
+    """
+    logger.info(f"开始流式运行代理任务: {task[:50]}...")
 
     stream_vw = 80
     stream_vh = int(80 * window_h // window_w)
@@ -628,15 +1071,20 @@ async def run_with_stream(
             # Periodically update the stream while the agent task is running
             while not agent_task.done():
                 try:
-                    encoded_screenshot = await capture_screenshot(_global_browser_context)
+                    # 使用 app_state 获取浏览器上下文进行截图
+                    browser_context = app_state.get_browser_context()
+                    encoded_screenshot = await capture_screenshot(browser_context)
                     if encoded_screenshot is not None:
                         html_content = f'<img src="data:image/jpeg;base64,{encoded_screenshot}" style="width:{stream_vw}vw; height:{stream_vh}vh ; border:1px solid #ccc;">'
                     else:
-                        html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>"
+                        html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>等待浏览器会话初始化...</h1>"
                 except Exception as e:
-                    html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Waiting for browser session...</h1>"
+                    logger.error(f"浏览器截图错误: {str(e)}")
+                    html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>等待浏览器会话初始化...</h1>"
 
-                if _global_agent and _global_agent.state.stopped:
+                # 使用 app_state 检查代理是否已经停止
+                agent = app_state.get_agent()
+                if agent and agent.state.stopped:
                     yield [
                         gr.HTML(value=html_content, visible=True),
                         final_result,
@@ -723,25 +1171,29 @@ theme_map = {
 
 
 async def close_global_browser():
-    global _global_browser, _global_browser_context
+    """关闭全局浏览器和浏览器上下文并释放资源"""
+    browser_context = app_state.get_browser_context()
+    if browser_context:
+        await browser_context.close()
+        app_state.set_browser_context(None)
 
-    if _global_browser_context:
-        await _global_browser_context.close()
-        _global_browser_context = None
-
-    if _global_browser:
-        await _global_browser.close()
-        _global_browser = None
+    browser = app_state.get_browser()
+    if browser:
+        await browser.close()
+        app_state.set_browser(None)
+        
+    logger.info("全局浏览器资源已释放")
 
 
 async def run_deep_search(research_task, max_search_iteration_input, max_query_per_iter_input, llm_provider,
-                          llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
-                          use_own_browser, headless, chrome_cdp):
+                           llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
+                           use_own_browser, headless, chrome_cdp):
+    """运行深度搜索研究任务"""
     from src.utils.deep_research import deep_research
-    global _global_agent_state
-
-    # Clear any previous stop request
-    _global_agent_state.clear_stop()
+    
+    # 获取代理状态并清除之前的停止请求
+    agent_state = app_state.get_agent_state()
+    agent_state.clear_stop()
 
     llm = utils.get_llm_model(
         provider=llm_provider,
@@ -751,14 +1203,14 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
         base_url=llm_base_url,
         api_key=llm_api_key,
     )
-    markdown_content, file_path = await deep_research(research_task, llm, _global_agent_state,
-                                                      max_search_iterations=max_search_iteration_input,
-                                                      max_query_num=max_query_per_iter_input,
-                                                      use_vision=use_vision,
-                                                      headless=headless,
-                                                      use_own_browser=use_own_browser,
-                                                      chrome_cdp=chrome_cdp
-                                                      )
+    markdown_content, file_path = await deep_research(research_task, llm, agent_state,
+                                                       max_search_iterations=max_search_iteration_input,
+                                                       max_query_num=max_query_per_iter_input,
+                                                       use_vision=use_vision,
+                                                       headless=headless,
+                                                       use_own_browser=use_own_browser,
+                                                       chrome_cdp=chrome_cdp
+                                                       )
 
     return markdown_content, file_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
 
@@ -1118,6 +1570,153 @@ https://www.cifnews.com/ 雨果跨境
                 inputs=[],
                 outputs=[stop_research_button, research_button],
             )
+
+            # 定时推送设置标签页
+            with gr.TabItem("⏰ 定时推送设置", id=6):
+                with gr.Row():
+                    with gr.Column():
+                        # 基本设置
+                        scheduler_enabled = gr.Checkbox(label="启用定时推送", value=False,
+                                                       info="启用后将按设定间隔自动执行任务")
+                        scheduler_interval = gr.Slider(label="推送间隔（小时）", minimum=0.1, maximum=24, step=0.1, value=1, 
+                                                    info="任务执行间隔时间，小数点表示小时分数")
+                        scheduler_task = gr.Textbox(label="定时任务内容", lines=4, 
+                                                  value="搜索最新的人工智能技术发展趋势，特别关注大型语言模型和生成式AI的应用",
+                                                  info="研究任务内容描述")
+                    
+                    with gr.Column():
+                        # 高级设置
+                        scheduler_title = gr.Textbox(label="推送标题前缀", value="深度研究",
+                                                  info="消息标题前缀，将与任务内容拼接")
+                        with gr.Row():
+                            scheduler_iterations = gr.Number(label="最大搜索迭代次数", value=2, minimum=1, maximum=5, step=1, precision=0,
+                                                        info="每次任务执行的最大搜索迭代次数")
+                            scheduler_queries = gr.Number(label="每迭代查询数", value=3, minimum=1, maximum=5, step=1, precision=0,
+                                                    info="每次迭代的最大查询数量")
+                
+                # 状态展示和操作按钮
+                with gr.Row():
+                    with gr.Column():
+                        scheduler_status_text = gr.Markdown("调度器状态: 未启动")
+                        scheduler_next_run_text = gr.Markdown("下次执行时间: 无排程")
+                    with gr.Column():
+                        with gr.Row():
+                            scheduler_start_btn = gr.Button("✔️ 启动调度器", variant="primary")
+                            scheduler_stop_btn = gr.Button("⛔ 停止调度器", variant="stop")
+                            scheduler_run_once_btn = gr.Button("▶️ 立即执行一次", variant="secondary")
+                
+                # 执行结果显示
+                scheduler_result_text = gr.Markdown("最新执行结果将在这里显示...")                
+                
+                # 绑定按钮事件
+                def update_scheduler_status():
+                    """
+                    更新调度器状态显示
+                    
+                    返回:
+                        tuple: (状态文本, 下次执行时间文本)
+                    """
+                    scheduler_status = app_state.get_scheduler_status()
+                    status = "运行中" if scheduler_status.get("running", False) else "未启动"
+                    next_run = scheduler_status.get("next_run_time")
+                    next_run_text = next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "无排程"
+                    last_status = scheduler_status.get("last_status", "")
+                    status_text = f"调度器状态: {status}" + (f" (最近状态: {last_status})" if last_status else "")
+                    next_run_md = f"下次执行时间: {next_run_text}"
+                    return status_text, next_run_md
+                
+                # 界面加载时初始化调度器状态显示
+                def init_scheduler_display():
+                    """
+                    界面加载时初始化调度器状态显示
+                    
+                    返回:
+                        tuple: (检测结果消息, 状态文本, 下次执行时间文本)
+                    """
+                    # 检测环境变量和必要依赖
+                    missing_config = []
+                    if not os.environ.get('DINGTALK_WEBHOOK_URL'):
+                        missing_config.append('钩子URL')
+                    if not os.environ.get('DINGTALK_SECRET'):
+                        missing_config.append('安全密钥')
+                    
+                    if missing_config:
+                        return f"警告: 缺少钩子配置: {', '.join(missing_config)}，请在环境变量中添加", *update_scheduler_status()
+                    
+                    # 回显调度器状态
+                    status, next_run = update_scheduler_status()
+                    return "已准备就绪，可启动调度器", status, next_run
+                
+                # 启动时初始化调度器状态
+                status_text, next_run_text = update_scheduler_status()
+                scheduler_status_text.value = status_text
+                scheduler_next_run_text.value = next_run_text
+                
+                # 检查配置并设置初始状态
+                init_result, status_text, next_run_text = init_scheduler_display()
+                scheduler_result_text.value = init_result
+                scheduler_status_text.value = status_text
+                scheduler_next_run_text.value = next_run_text
+                
+                # 启动调度器函数
+                def ui_start_scheduler(enabled, task, interval, title, iterations, queries):
+                    if not enabled:
+                        return "请先勾选启用定时推送选项", *update_scheduler_status()
+                    
+                    if not task or task.strip() == "":
+                        return "请输入有效的任务内容", *update_scheduler_status()
+                    
+                    # 调用启动调度器函数
+                    result = start_scheduler(
+                        research_task=task,
+                        interval_hours=float(interval),
+                        title_prefix=title,
+                        search_iterations=int(iterations),
+                        query_per_iter=int(queries)
+                    )
+                    
+                    # 更新状态显示
+                    return result, *update_scheduler_status()
+                
+                # 停止调度器函数
+                def ui_stop_scheduler():
+                    result = stop_scheduler()
+                    return result, *update_scheduler_status()
+                
+                # 立即执行一次函数
+                def ui_run_once(task, title, iterations, queries):
+                    if not task or task.strip() == "":
+                        return "请输入有效的任务内容", *update_scheduler_status()
+                    
+                    # 调用执行一次函数
+                    result_msg, status_text, next_run_text = run_push_task_once(
+                        research_task=task,
+                        title_prefix=title,
+                        search_iterations=int(iterations),
+                        query_per_iter=int(queries)
+                    )
+                    
+                    return result_msg, status_text, next_run_text
+                
+                # 绑定按钮事件
+                scheduler_start_btn.click(
+                    fn=ui_start_scheduler,
+                    inputs=[scheduler_enabled, scheduler_task, scheduler_interval, 
+                            scheduler_title, scheduler_iterations, scheduler_queries],
+                    outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
+                )
+                
+                scheduler_stop_btn.click(
+                    fn=ui_stop_scheduler,
+                    inputs=[],
+                    outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
+                )
+                
+                scheduler_run_once_btn.click(
+                    fn=ui_run_once,
+                    inputs=[scheduler_task, scheduler_title, scheduler_iterations, scheduler_queries],
+                    outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
+                )
 
             with gr.TabItem("🎥 Recordings", id=7, visible=True):
                 def list_recordings(save_recording_path):
