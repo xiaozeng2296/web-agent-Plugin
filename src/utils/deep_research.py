@@ -1,40 +1,25 @@
-import pdb
-
 from dotenv import load_dotenv
 
 load_dotenv()
 import asyncio
 import os
-import sys
 import logging
-from pprint import pprint
 from uuid import uuid4
-from src.utils import utils
 from src.agent.custom_agent import CustomAgent
 import json
 import re
-from browser_use.agent.service import Agent
-from browser_use.browser.browser import BrowserConfig, Browser
+from browser_use.browser.browser import BrowserConfig
 from browser_use.agent.views import ActionResult
-from browser_use.browser.context import BrowserContext
-from browser_use.controller.service import Controller, DoneAction
 from main_content_extractor import MainContentExtractor
 from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
     HumanMessage,
-    ToolMessage,
     SystemMessage
 )
 from json_repair import repair_json
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 from src.controller.custom_controller import CustomController
 from src.browser.custom_browser import CustomBrowser
-from src.browser.custom_context import BrowserContextConfig, BrowserContext
-from browser_use.browser.context import (
-    BrowserContextConfig,
-    BrowserContextWindowSize,
-)
+from src.browser.custom_context import BrowserContext
 
 logger = logging.getLogger(__name__)
 
