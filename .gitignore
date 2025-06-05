@@ -165,6 +165,8 @@ cython_debug/
 .idea/
 temp
 tmp
+ai.gemini-in-the-cloud
+temp_chrome_profile
 
 
 .DS_Store

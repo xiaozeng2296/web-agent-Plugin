@@ -124,18 +124,75 @@ class AppState:
             self._update_scheduler_status()
             self._update_activity_time()
             logger.debug("调度器实例已更新")
+            
+    def set_scheduler_async(self, scheduler):
+        """
+        异步设置全局调度器实例，不使用锁
+        
+        参数:
+            scheduler: 要设置的调度器实例
+        """
+        # 直接更新调度器，不使用锁
+        self._scheduler = scheduler
+        
+        # 更新活动时间
+        self._resource_stats["last_activity_time"] = datetime.now()
+        
+        # 异步更新调度器状态
+        if scheduler and hasattr(scheduler, "running"):
+            status_update = {"running": scheduler.running}
+            
+            # 获取下次执行时间
+            if scheduler.running and len(scheduler.get_jobs()) > 0:
+                job = scheduler.get_jobs()[0]
+                if job and job.next_run_time:
+                    status_update["next_run_time"] = job.next_run_time
+            
+            # 更新状态，不阻塞
+            self._scheduler_status.update(status_update)
+            
+        logger.debug("调度器实例已异步更新")
     
     def get_scheduler_status(self) -> Dict:
         """获取调度器状态"""
         with self._lock:
             return self._scheduler_status.copy()
     
-    def update_scheduler_status(self, status_update: Dict):
-        """更新调度器状态"""
-        with self._lock:
+    def update_scheduler_status(self, status_update: Dict, blocking=True, timeout=1.0):
+        """
+        更新调度器状态
+        
+        参数:
+            status_update: 要更新的状态字典
+            blocking: 是否阻塞等待锁，如果为False，则立即返回而不等待
+            timeout: 获取锁的超时时间（秒）
+        
+        返回:
+            bool: 更新是否成功
+        """
+        # 如果不需要阻塞，尝试获取锁，如果失败则直接返回
+        if not blocking and not self._lock.acquire(blocking=False):
+            logger.debug(f"无法获取锁，跳过状态更新: {status_update}")
+            return False
+            
+        # 阻塞模式，在超时时间内获取锁
+        try:
+            if blocking and not self._lock.acquire(blocking=True, timeout=timeout):
+                logger.warning(f"获取锁超时，跳过状态更新: {status_update}")
+                return False
+                
+            # 已成功获取锁，更新状态
             self._scheduler_status.update(status_update)
             self._update_activity_time()
             logger.debug(f"调度器状态已更新: {status_update}")
+            return True
+        finally:
+            # 确保锁被释放
+            try:
+                self._lock.release()
+            except RuntimeError:
+                # 锁未获取则忽略
+                pass
     
     def _update_scheduler_status(self):
         """根据当前调度器更新状态信息"""
