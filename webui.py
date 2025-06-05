@@ -738,6 +738,8 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
                           llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
                           use_own_browser, headless, chrome_cdp):
     from src.utils.deep_research import deep_research
+    from src.utils.ppt_download import get_ppt
+    import os
     global _global_agent_state
 
     # Clear any previous stop request
@@ -759,8 +761,18 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
                                                       use_own_browser=use_own_browser,
                                                       chrome_cdp=chrome_cdp
                                                       )
-
-    return markdown_content, file_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+    
+    # 生成PPT并返回文件路径
+    ppt_path = None
+    if file_path and os.path.exists(file_path) and markdown_content:
+        try:
+            # 调用get_ppt函数生成PPT
+            ppt_path = get_ppt(markdown_content)
+            logger.info(f"Generated PPT at: {ppt_path}")
+        except Exception as e:
+            logger.error(f"Error generating PPT: {str(e)}")
+    
+    return markdown_content, file_path, ppt_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
 
 
 def create_ui(theme_name="Ocean"):
@@ -1070,7 +1082,11 @@ https://www.cifnews.com/ 雨果跨境
                     research_button = gr.Button("▶️ Run Deep Research", variant="primary", scale=2)
                     stop_research_button = gr.Button("⏹ Stop", variant="stop", scale=1)
                 markdown_output_display = gr.Markdown(label="Research Report")
-                markdown_download = gr.File(label="Download Research Report")
+                # Markdown和PPT下载部分
+                with gr.Row():
+                    markdown_download = gr.File(label="下载Markdown报告", interactive=False)
+                with gr.Row():
+                    ppt_download = gr.File(label="下载PPT报告", interactive=False)
 
             # Bind the stop button click event after errors_output is defined
             stop_button.click(
@@ -1104,15 +1120,30 @@ https://www.cifnews.com/ 雨果跨境
                 ],
             )
 
+            # 点击按钮生成并下载PPT的函数
+            def generate_ppt_on_click(markdown_content):
+                if not markdown_content:
+                    return None
+                try:
+                    from src.utils.ppt_download import get_ppt
+                    ppt_path = get_ppt(markdown_content)
+                    logger.info(f"Generated PPT at: {ppt_path}")
+                    # 返回文件路径和更新显示状态
+                    return ppt_path, gr.update(visible=True)
+                except Exception as e:
+                    logger.error(f"Error generating PPT: {str(e)}")
+                    return None, gr.update(visible=False)
+            
             # Run Deep Research
             research_button.click(
                 fn=run_deep_search,
                 inputs=[research_task_input, max_search_iteration_input, max_query_per_iter_input, llm_provider,
                         llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
                         use_own_browser, headless, chrome_cdp],
-                outputs=[markdown_output_display, markdown_download, stop_research_button, research_button]
+                outputs=[markdown_output_display, markdown_download, ppt_download, stop_research_button, research_button]
             )
-            # Bind the stop button click event after errors_output is defined
+            
+            # Bind the stop button click event
             stop_research_button.click(
                 fn=stop_research_agent,
                 inputs=[],
