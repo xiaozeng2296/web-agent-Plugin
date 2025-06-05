@@ -734,6 +734,34 @@ async def close_global_browser():
         _global_browser = None
 
 
+# Function to optimize the research task prompt
+async def optimize_prompt(prompt_text, llm_provider,
+                          llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key):
+    try:
+        llm = utils.get_llm_model(
+            provider=llm_provider,
+            model_name=llm_model_name,
+            num_ctx=llm_num_ctx,
+            temperature=llm_temperature,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+        )
+        prompt = '''你是一个研究任务扩展专家。当用户提出简短的研究需求时，请你从用户的角度出发，将其扩展为更全面、更有深度的研究请求。具体来说：
+        1.识别用户研究主题的核心领域
+        2.补充3 - 5个可能的研究角度或维度
+        3.提出2 - 3个可能的分析方法或步骤
+        4.明确1 - 2个期望的研究成果或应用
+
+        保持用户的第一人称语气，直接返回扩展后的研究需求，不要添加任何解释。例如，当用户输入'我要一份牛奶分析报告'时，你应该将其扩展为'我需要一份全面的牛奶分析报告，希望从市场趋势、营养成分对比、消费者偏好和价格波动等角度进行深入研究。建议采用数据可视化方式呈现市场份额变化，并通过对比分析揭示不同品牌的优劣势。最终希望该报告能指导我的购买决策并提供未来牛奶行业发展趋势的洞察。'
+
+        用户输入的是：'''
+        ai_query_msg = llm.invoke(prompt+prompt_text)
+        return ai_query_msg.content
+    except Exception as e:
+        logger.error(f"Error optimizing prompt: {str(e)}")
+        return f"优化失败: {str(e)}"
+
+
 async def run_deep_search(research_task, max_search_iteration_input, max_query_per_iter_input, llm_provider,
                           llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
                           use_own_browser, headless, chrome_cdp):
@@ -761,7 +789,7 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
                                                       use_own_browser=use_own_browser,
                                                       chrome_cdp=chrome_cdp
                                                       )
-    
+
     # 生成PPT并返回文件路径
     ppt_path = None
     if file_path and os.path.exists(file_path) and markdown_content:
@@ -771,7 +799,7 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
             logger.info(f"Generated PPT at: {ppt_path}")
         except Exception as e:
             logger.error(f"Error generating PPT: {str(e)}")
-    
+
     return markdown_content, file_path, ppt_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
 
 
@@ -1081,6 +1109,7 @@ https://www.cifnews.com/ 雨果跨境
                 with gr.Row():
                     research_button = gr.Button("▶️ Run Deep Research", variant="primary", scale=2)
                     stop_research_button = gr.Button("⏹ Stop", variant="stop", scale=1)
+                    task_opt_button = gr.Button("提示词美化", variant="stop", scale=1)
                 markdown_output_display = gr.Markdown(label="Research Report")
                 # Markdown和PPT下载部分
                 with gr.Row():
@@ -1133,7 +1162,7 @@ https://www.cifnews.com/ 雨果跨境
                 except Exception as e:
                     logger.error(f"Error generating PPT: {str(e)}")
                     return None, gr.update(visible=False)
-            
+
             # Run Deep Research
             research_button.click(
                 fn=run_deep_search,
@@ -1142,12 +1171,20 @@ https://www.cifnews.com/ 雨果跨境
                         use_own_browser, headless, chrome_cdp],
                 outputs=[markdown_output_display, markdown_download, ppt_download, stop_research_button, research_button]
             )
-            
+
             # Bind the stop button click event
             stop_research_button.click(
                 fn=stop_research_agent,
                 inputs=[],
                 outputs=[stop_research_button, research_button],
+            )
+
+            # Connect the task_opt_button to the optimize_prompt function
+            task_opt_button.click(
+                fn=optimize_prompt,
+                inputs=[research_task_input,llm_provider,
+                        llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key],
+                outputs=[research_task_input]
             )
 
             with gr.TabItem("🎥 Recordings", id=7, visible=True):
