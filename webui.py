@@ -1,7 +1,15 @@
 import pdb
 import logging
+import threading
+from datetime import datetime, timedelta
 
+from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
+
+from src.utils.deep_research import deep_research
+from src.utils.ding_talk import DingTalkRobot
 
 load_dotenv()
 import os
@@ -25,7 +33,7 @@ from browser_use.browser.context import (
 )
 from langchain_ollama import ChatOllama
 from playwright.async_api import async_playwright
-from src.utils.agent_state import AgentState
+from src.utils.agent_state import AgentState, app_state
 
 from src.utils import utils
 from src.agent.custom_agent import CustomAgent
@@ -33,6 +41,7 @@ from src.browser.custom_browser import CustomBrowser
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
 from src.controller.custom_controller import CustomController
+from src.ui.scheduler_tab import create_scheduler_tab
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot, MissingAPIKeyError
 from src.utils import utils
@@ -112,6 +121,530 @@ def resolve_sensitive_env_variables(text):
             result = result.replace(var, env_value)
 
     return result
+
+
+# 调度器关闭钩子函数
+def shutdown_scheduler():
+    """
+    在程序退出时关闭调度器
+    """
+    scheduler = app_state.get_scheduler()
+    if scheduler and scheduler.running:
+        logger.info("程序退出，关闭调度器")
+        scheduler.shutdown(wait=False)
+
+
+# 注册退出钩子
+import atexit
+
+atexit.register(shutdown_scheduler)
+
+
+def start_scheduler(research_task, interval_minutes=60, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    启动定时推送调度器
+
+    参数:
+        research_task: 研究任务内容
+        interval_minutes: 执行间隔分钟数
+        title_prefix: 标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+
+    返回:
+        启动结果消息
+    """
+    try:
+        logger.info(f"尝试启动调度器，任务: {research_task}, 间隔: {interval_minutes} 分钟")
+
+        # 参数验证
+        if not research_task or not isinstance(research_task, str) or research_task.strip() == "":
+            error_msg = "研究任务必须为非空字符串"
+            logger.error(error_msg)
+            return error_msg
+
+        if not isinstance(interval_minutes, (int, float)) or interval_minutes < 1:
+            error_msg = "时间间隔必须是正整数分钟数"
+            logger.error(error_msg)
+            return error_msg
+
+        # 确保间隔是整数分钟
+        interval_minutes = int(interval_minutes)
+
+        # 创建新调度器
+        new_scheduler = BackgroundScheduler(
+            executors={'default': ThreadPoolExecutor(max_workers=20)},
+            job_defaults={
+                'coalesce': True,  # 合并多个错过的任务
+                'max_instances': 1,  # 同一个任务最大并行数
+                'misfire_grace_time': 600  # 错过执行的宽限时间
+            }
+        )
+
+        # 停止现有调度器(如果存在)
+        current_scheduler = app_state.get_scheduler()
+        if current_scheduler:
+            try:
+                logger.info("关闭现有调度器")
+                current_scheduler.shutdown(wait=False)
+            except Exception as e:
+                logger.warning(f"关闭旧调度器时发生异常: {str(e)}")
+
+        # 立即更新全局调度器实例（使用异步方式，避免锁冲突）
+        logger.info("异步设置新调度器为全局实例")
+        app_state.set_scheduler_async(new_scheduler)
+
+        # 设置定时触发器 - 使用分钟为单位
+        # 将分钟转换为浮点数以支持精确计时
+        trigger = IntervalTrigger(minutes=float(interval_minutes))
+
+        # 准备定时任务参数
+        job_args = {
+            'research_task': research_task,
+            'title_prefix': title_prefix,
+            'search_iterations': search_iterations,
+            'query_per_iter': query_per_iter
+        }
+
+        # 创建异步任务的包装函数
+        def _scheduled_job_wrapper(**job_kwargs):
+            """异步函数包装器函数，用于调度器调用"""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                # 运行异步任务
+                return loop.run_until_complete(
+                    scheduled_job(**job_kwargs)
+                )
+            finally:
+                loop.close()
+
+        # 添加任务到调度器
+        new_scheduler.add_job(
+            _scheduled_job_wrapper,  # 使用包装函数
+            trigger=trigger,
+            kwargs=job_args,
+            id='deep_research_job',
+            replace_existing=True,
+            misfire_grace_time=600
+        )
+
+        try:
+            # 启动调度器 - 简化版本，不更新状态
+            logger.info("开始启动调度器...")
+            new_scheduler.start()
+            logger.info(f"调度器已成功启动，下次执行将在 {interval_minutes} 分钟后")
+
+            # 计算下次执行时间（仅用于生成消息）
+            next_run_time = datetime.now() + timedelta(minutes=interval_minutes)
+
+            # 启动后立即执行一次任务
+            logger.info("调度器启动后立即执行一次任务...")
+
+            # 创建一个新线程来执行任务，避免阻塞主线程
+            def immediate_execute():
+                try:
+                    # 设置新的事件循环
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        # 使用相同的参数运行任务
+                        result = loop.run_until_complete(scheduled_job(
+                            research_task=research_task,
+                            title_prefix=title_prefix,
+                            search_iterations=search_iterations,
+                            query_per_iter=query_per_iter,
+                            is_manual=True  # 标记为手动触发
+                        ))
+                        logger.info(f"立即执行任务结果: {result}")
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    logger.error(f"立即执行任务异常: {str(e)}", exc_info=True)
+
+            # 启动立即执行线程
+            immediate_thread = threading.Thread(target=immediate_execute)
+            immediate_thread.daemon = True  # 设置为守护线程，不阻塞主程序退出
+            immediate_thread.start()
+
+            # 生成成功消息
+            if interval_minutes >= 60:
+                hours = interval_minutes / 60
+                if hours == int(hours):
+                    # 整数小时
+                    success_msg = f"调度器已成功启动，将每 {int(hours)} 小时执行一次。下次执行时间: {next_run_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                else:
+                    # 小数小时
+                    success_msg = f"调度器已成功启动，将每 {hours:.1f} 小时执行一次。下次执行时间: {next_run_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            else:
+                # 少于一小时，直接显示分钟
+                success_msg = f"调度器已成功启动，将每 {interval_minutes} 分钟执行一次。下次执行时间: {next_run_time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+            logger.info(f"调度器启动成功: {success_msg}")
+            return success_msg
+
+        except Exception as e:
+            error_msg = f"启动调度器时发生异常: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+
+    except Exception as e:
+        error_msg = f"启动调度器失败: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
+
+
+def get_next_run_time():
+    """
+    获取下一次定时任务执行时间
+    
+    返回:
+        datetime: 下一次执行的时间点，如果没有调度任务则返回None
+    """
+    try:
+        # 获取当前调度器实例
+        scheduler = app_state.get_scheduler()
+        if not scheduler or not hasattr(scheduler, "running") or not scheduler.running:
+            return None
+        
+        # 获取所有任务
+        jobs = scheduler.get_jobs()
+        if not jobs:
+            return None
+            
+        # 找出下一个要执行的任务时间
+        next_run_time = None
+        for job in jobs:
+            if job.next_run_time:
+                if next_run_time is None or job.next_run_time < next_run_time:
+                    next_run_time = job.next_run_time
+        
+        return next_run_time
+    except Exception as e:
+        logger.error(f"获取下一次执行时间异常: {str(e)}")
+        return None
+
+
+def stop_scheduler():
+    """
+    停止定时推送调度器
+
+    返回:
+        停止结果消息
+    """
+    try:
+        logger.info("尝试停止调度器...")
+
+        # 获取当前调度器实例
+        scheduler = app_state.get_scheduler()
+
+        # 判断调度器是否存在并且在运行
+        if scheduler and hasattr(scheduler, "running") and scheduler.running:
+            logger.info("正在关闭运行中的调度器...")
+
+            # 尝试关闭调度器
+            try:
+                scheduler.shutdown(wait=False)
+                logger.info("调度器已成功关闭")
+            except Exception as shutdown_error:
+                logger.warning(f"关闭调度器时发生异常: {str(shutdown_error)}", exc_info=True)
+
+            # 释放调度器实例
+            app_state.set_scheduler(None)
+
+            # 更新调度器状态(非阻塞模式)
+            scheduler_status = {
+                "running": False,
+                "next_run_time": None,
+                "last_status": "调度器已停止",
+                "last_update_time": datetime.now()
+            }
+            app_state.update_scheduler_status(scheduler_status, blocking=False)
+            logger.info("已请求更新调度器状态为已停止")
+
+            success_msg = "调度器已成功停止"
+            logger.info(success_msg)
+            return success_msg
+        else:
+            info_msg = "调度器已经处于停止状态"
+            logger.info(info_msg)
+            return info_msg
+
+    except Exception as e:
+        error_msg = f"停止调度器时发生异常: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+
+        # 尝试更新错误状态
+        try:
+            app_state.update_scheduler_status({
+                "running": False,
+                "last_status": f"停止失败: {str(e)[:50]}",
+                "last_update_time": datetime.now(),
+                "error": str(e)
+            }, blocking=False)
+            logger.info(f"已请求更新调度器停止失败状态")
+        except Exception as status_error:
+            logger.error(f"无法更新调度器状态: {str(status_error)}", exc_info=True)
+
+        return error_msg
+
+
+# 立即执行一次推送任务
+async def run_push_task_once(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    立即执行一次推送任务 (异步版本)
+
+    参数:
+        research_task: 研究任务内容
+        title_prefix: 标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+
+    返回:
+        执行结果消息, 状态文本, 下次执行时间文本
+    """
+    try:
+        logger.info(f"用户触发立即执行一次按钮, 研究任务: {research_task}")
+
+        # 调用异步的scheduled_job函数，指定为手动执行模式
+        result, status_text, next_run_text = await scheduled_job(
+            research_task,
+            title_prefix,
+            search_iterations,
+            query_per_iter,
+            is_manual=True
+        )
+
+        # 返回结果
+        return f"执行成功: {result}", status_text, next_run_text
+
+    except Exception as e:
+        error_msg = f"执行失败: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+
+        # 更新错误状态
+        app_state.update_scheduler_status(
+            {"last_status": f"执行异常: {str(e)[:50]}", "last_run_time": datetime.now()},
+            blocking=False
+        )
+
+        # 返回错误状态
+        return error_msg, f"执行状态: 错误 ({str(e)[:50]})", "执行失败"
+
+
+async def execute_push_task(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+    """
+    执行深度研究并将结果推送到钉钉
+
+    参数:
+        research_task: 研究任务内容
+        title_prefix: 标题前缀
+        search_iterations: 最大搜索迭代次数
+        query_per_iter: 每次迭代的最大查询数量
+
+    返回:
+        str: 结果消息
+    """
+    try:
+        start_time = datetime.now()
+        logger.info(f"深度研究任务开始执行: {research_task}")
+
+        # 使用非阻塞方式更新调度器状态
+        scheduler_status = {
+            "last_run_time": start_time,
+            "last_status": "运行中"
+        }
+        # app_state.update_scheduler_status(scheduler_status, blocking=False)
+
+        # 创建代理状态
+        agent_state = AgentState()
+        # 使用app_state替代agent_state调用clear_stop方法
+        app_state.clear_stop()
+
+        # 获取LLM模型 - 使用阿里云配置
+        llm = utils.get_llm_model(
+            provider="alibaba",
+            model_name=os.getenv("ALIBABA_MODEL_NAME", "qwen-plus"),
+            num_ctx=int(os.getenv("ALIBABA_CTX_SIZE", "4096")),
+            temperature=float(os.getenv("ALIBABA_TEMPERATURE", "0.7")),
+            base_url=os.getenv("ALIBABA_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            api_key=os.getenv("ALIBABA_API_KEY", "sk-a144d606f37245d486e7ed61cd53c2fe"),
+        )
+
+        # 执行深度研究
+        logger.info(f"开始执行深度研究: {research_task}")
+        markdown_content, file_path = await deep_research(
+            research_task,
+            llm,
+            agent_state,
+            max_search_iterations=search_iterations,
+            max_query_num=query_per_iter,
+            use_vision=True,
+            headless=True,
+            use_own_browser=False
+        )
+
+        # 计算执行时间
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        duration_str = f"{duration:.2f}秒" if duration < 60 else f"{duration / 60:.2f}分钟"
+
+        # 准备推送内容
+        if markdown_content:
+            # 标题包含任务简述和执行时间
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            title = f"{title_prefix}: {research_task[:20]}..." if len(
+                research_task) > 20 else f"{title_prefix}: {research_task}"
+
+            # 消息头部添加执行信息
+            message_header = f"## {title}\n\n"
+            message_header += f"**执行时间**: {current_time}\n\n"
+            message_header += f"**耗时**: {duration_str}\n\n"
+            message_header += f"**任务**: {research_task}\n\n"
+            message_header += "---\n\n"
+
+            # 拼接内容，钉钉限制消息长度，超长时需要截断
+            message = message_header + markdown_content
+            if len(message) > 20000:  # 钉钉消息长度限制
+                message = message[:19700] + "\n\n...(内容已截断，完整内容请查看生成的文件)"
+
+            # 发送到钉钉
+            logger.info(f"发送研究结果到钉钉，标题: {title}, 内容长度: {len(message)}")
+            try:
+                send_result = DingTalkRobot.send_markdown(title, message)
+                if send_result:
+                    result_msg = f"任务执行成功并推送至钉钉，耗时: {duration_str}"
+                    logger.info(result_msg)
+                    app_state.update_scheduler_status({"last_status": "执行成功"}, blocking=False)
+                else:
+                    result_msg = f"任务执行成功但钉钉推送失败，耗时: {duration_str}"
+                    logger.error(result_msg)
+                    app_state.update_scheduler_status({"last_status": "推送失败"}, blocking=False)
+            except Exception as e:
+                result_msg = f"钉钉推送失败: {str(e)}"
+                logger.error(result_msg, exc_info=True)
+                app_state.update_scheduler_status({"last_status": "推送异常"}, blocking=False)
+        else:
+            result_msg = "任务执行失败，未获得研究结果"
+            logger.warning(result_msg)
+            app_state.update_scheduler_status({"last_status": "执行失败"}, blocking=False)
+
+        return result_msg, markdown_content, file_path
+
+    except Exception as e:
+        error_msg = f"定时任务执行异常: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        app_state.update_scheduler_status({"last_status": f"执行异常: {str(e)[:50]}"})
+
+        # 发送错误通知到钉钉
+        try:
+            error_title = "深度研究任务执行异常"
+            error_content = f"## 深度研究任务执行异常\n\n"
+            error_content += f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            error_content += f"**任务**: {research_task}\n\n"
+            error_content += f"**错误**: {str(e)}\n\n"
+            DingTalkRobot.send_markdown(error_title, error_content)
+        except Exception as send_error:
+            logger.error(f"发送错误通知失败: {str(send_error)}")
+
+        return error_msg, None, None
+
+
+
+async def scheduled_job(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3, is_manual=False):
+    """
+    定时任务入口函数 - 异步版本
+
+    参数:
+        research_task: 研究任务
+        title_prefix: 标题前缀
+        search_iterations: 搜索迭代次数
+        query_per_iter: 每次迭代查询数量
+        is_manual: 是否为手动触发的任务
+
+    返回:
+        执行结果、状态文本、下次执行时间文本
+    """
+    try:
+        if not research_task or not isinstance(research_task, str) or research_task.strip() == "":
+            raise ValueError("研究任务不能为空")
+
+        mode = "手动" if is_manual else "定时"
+        logger.info(f"{mode}任务触发，研究任务: {research_task}")
+
+        # 获取代理状态
+        app_state.get_agent_state()
+        # 使用app_state替代agent_state调用clear_stop方法
+        app_state.clear_stop()
+
+        # 获取超时设置
+        timeout_seconds = int(os.getenv("TASK_TIMEOUT", "600"))
+
+        # 直接异步执行任务
+        try:
+            # 使用asyncio.wait_for设置超时
+            result, markdown_content, file_path = await asyncio.wait_for(
+                execute_push_task(
+                    research_task,
+                    title_prefix,
+                    search_iterations,
+                    query_per_iter
+                ),
+                timeout=timeout_seconds
+            )
+
+            # 任务成功完成
+            logger.info(f"{mode}任务执行完成: {research_task}")
+
+            # 更新最终状态（不使用中间状态）
+            app_state.update_scheduler_status(
+                {"last_status": f"{mode}执行完成", "last_run_time": datetime.now()},
+                blocking=False
+            )
+
+            # 返回成功结果
+            status_text = f"执行状态: 成功完成"
+            next_run_text = "手动执行完成"
+            if not is_manual:
+                next_run = get_next_run_time()
+                if next_run:
+                    next_run_text = f"下次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}"
+
+            return result, status_text, next_run_text
+
+        except asyncio.TimeoutError:
+            # 处理任务超时
+            error_msg = f"任务执行超时（{timeout_seconds}秒）"
+            logger.error(error_msg)
+
+            # 更新超时状态
+            app_state.update_scheduler_status(
+                {"last_status": "执行超时", "last_run_time": datetime.now()},
+                blocking=False
+            )
+
+            # 尝试发送超时通知
+            try:
+                timeout_title = f"【{title_prefix}】任务执行超时"
+                timeout_text = f"研究任务 '{research_task}' 执行超时（{timeout_seconds}秒）"
+                # 如果需要发送通知，可以在这里添加代码
+            except Exception as e:
+                logger.error(f"发送超时通知失败：{str(e)}")
+
+            return f"执行超时（{timeout_seconds}秒）", "执行状态: 超时", "执行失败"
+
+    except Exception as e:
+        # 处理其他异常
+        error_msg = f"定时任务执行异常: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+
+        # 更新异常状态
+        app_state.update_scheduler_status(
+            {"last_status": f"执行异常: {str(e)[:50]}", "last_run_time": datetime.now()},
+            blocking=False
+        )
+
+        return f"任务异常: {str(e)}", f"执行状态: 异常 ({str(e)[:50]})", "执行失败"
 
 
 async def stop_agent():
@@ -771,7 +1304,8 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
     global _global_agent_state
 
     # Clear any previous stop request
-    _global_agent_state.clear_stop()
+    # 使用app_state替代agent_state调用clear_stop方法
+    app_state.clear_stop()
 
     llm = utils.get_llm_model(
         provider=llm_provider,
@@ -1185,6 +1719,49 @@ https://www.cifnews.com/ 雨果跨境
                 inputs=[research_task_input,llm_provider,
                         llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key],
                 outputs=[research_task_input]
+            )
+            
+            # 添加定时推送设置标签页
+            (
+                scheduler_enabled, scheduler_interval, scheduler_task, scheduler_title,
+                scheduler_iterations, scheduler_queries, scheduler_status_text,
+                scheduler_next_run_text, scheduler_start_btn, scheduler_stop_btn,
+                scheduler_run_once_btn, scheduler_result_text
+            ) = create_scheduler_tab()
+            
+            # 绑定定时推送标签页的事件处理
+            # 创建一个辅助函数来转换小时到分钟
+            def convert_hours_to_minutes(hours, task, title, iterations, queries):
+                minutes = int(float(hours) * 60)  # 将小时转换为分钟
+                return start_scheduler(task, minutes, title, iterations, queries)
+                
+            scheduler_start_btn.click(
+                fn=convert_hours_to_minutes,
+                inputs=[
+                    scheduler_interval,
+                    scheduler_task,
+                    scheduler_title,
+                    scheduler_iterations,
+                    scheduler_queries
+                ],
+                outputs=[scheduler_result_text]
+            )
+            
+            scheduler_stop_btn.click(
+                fn=stop_scheduler,
+                inputs=[],
+                outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
+            )
+            
+            scheduler_run_once_btn.click(
+                fn=run_push_task_once,
+                inputs=[
+                    scheduler_task,
+                    scheduler_title,
+                    scheduler_iterations,
+                    scheduler_queries
+                ],
+                outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
             )
 
             with gr.TabItem("🎥 Recordings", id=7, visible=True):

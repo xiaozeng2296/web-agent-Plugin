@@ -16,6 +16,8 @@ import re
 from browser_use.agent.service import Agent
 from browser_use.browser.browser import BrowserConfig, Browser
 from browser_use.agent.views import ActionResult
+# 导入应用状态管理类
+from src.utils.agent_state import app_state
 from browser_use.browser.context import BrowserContext
 from browser_use.controller.service import Controller, DoneAction
 from main_content_extractor import MainContentExtractor
@@ -259,7 +261,8 @@ async def deep_research(task, llm, agent_state=None, **kwargs):
                 query_results = await asyncio.gather(
                     *[agent.run(max_steps=kwargs.get("max_steps", 10)) for agent in agents])
 
-            if agent_state and agent_state.is_stop_requested():
+            # 检查是否请求停止任务
+            if app_state.is_stop_requested():
                 # Stop
                 break
             # 3. Summarize Search Result
@@ -295,7 +298,8 @@ async def deep_research(task, llm, agent_state=None, **kwargs):
                     record_content = repair_json(record_content)
                     new_record_infos = json.loads(record_content)
                     history_infos.extend(new_record_infos)
-            if agent_state and agent_state.is_stop_requested():
+            # 检查是否请求停止任务
+            if app_state.is_stop_requested():
                 # Stop
                 break
 
