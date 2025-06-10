@@ -45,7 +45,7 @@ def create_scheduler_tab():
                     # 高级设置
                     scheduler_title = gr.Textbox(
                         label="推送标题前缀", 
-                        value="深度研究",
+                        value="深度搜索",
                         info="消息标题前缀，将与任务内容拼接"
                     )
                     with gr.Row():

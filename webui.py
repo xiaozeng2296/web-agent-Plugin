@@ -1,4 +1,3 @@
-import pdb
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -8,11 +7,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
+from src.ui.scheduler_tab import create_scheduler_tab
 from src.utils.deep_research import deep_research
 from src.utils.ding_talk import DingTalkRobot
+from src.utils.scheduler_utils import SchedulerManager
 
 load_dotenv()
-import os
 import glob
 import asyncio
 import argparse
@@ -21,27 +21,19 @@ import os
 logger = logging.getLogger(__name__)
 
 import gradio as gr
-import inspect
-from functools import wraps
 
 from browser_use.agent.service import Agent
-from playwright.async_api import async_playwright
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import (
-    BrowserContextConfig,
     BrowserContextWindowSize,
 )
-from langchain_ollama import ChatOllama
-from playwright.async_api import async_playwright
 from src.utils.agent_state import AgentState, app_state
 
-from src.utils import utils
 from src.agent.custom_agent import CustomAgent
 from src.browser.custom_browser import CustomBrowser
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
-from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
+from src.browser.custom_context import BrowserContextConfig
 from src.controller.custom_controller import CustomController
-from src.ui.scheduler_tab import create_scheduler_tab
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot, MissingAPIKeyError
 from src.utils import utils
@@ -140,7 +132,9 @@ import atexit
 atexit.register(shutdown_scheduler)
 
 
-def start_scheduler(research_task, interval_minutes=60, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+def start_scheduler(llm_provider,
+                    llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, research_task,
+                    interval_minutes=60, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
     """
     启动定时推送调度器
 
@@ -250,6 +244,12 @@ def start_scheduler(research_task, interval_minutes=60, title_prefix="深度研�
                     try:
                         # 使用相同的参数运行任务
                         result = loop.run_until_complete(scheduled_job(
+                            llm_provider=llm_provider,
+                            llm_model_name=llm_model_name,
+                            ollama_num_ctx=ollama_num_ctx,
+                            llm_temperature=llm_temperature,
+                            llm_base_url=llm_base_url,
+                            llm_api_key=llm_api_key,
                             research_task=research_task,
                             title_prefix=title_prefix,
                             search_iterations=search_iterations,
@@ -294,103 +294,10 @@ def start_scheduler(research_task, interval_minutes=60, title_prefix="深度研�
         return error_msg
 
 
-def get_next_run_time():
-    """
-    获取下一次定时任务执行时间
-    
-    返回:
-        datetime: 下一次执行的时间点，如果没有调度任务则返回None
-    """
-    try:
-        # 获取当前调度器实例
-        scheduler = app_state.get_scheduler()
-        if not scheduler or not hasattr(scheduler, "running") or not scheduler.running:
-            return None
-        
-        # 获取所有任务
-        jobs = scheduler.get_jobs()
-        if not jobs:
-            return None
-            
-        # 找出下一个要执行的任务时间
-        next_run_time = None
-        for job in jobs:
-            if job.next_run_time:
-                if next_run_time is None or job.next_run_time < next_run_time:
-                    next_run_time = job.next_run_time
-        
-        return next_run_time
-    except Exception as e:
-        logger.error(f"获取下一次执行时间异常: {str(e)}")
-        return None
-
-
-def stop_scheduler():
-    """
-    停止定时推送调度器
-
-    返回:
-        停止结果消息
-    """
-    try:
-        logger.info("尝试停止调度器...")
-
-        # 获取当前调度器实例
-        scheduler = app_state.get_scheduler()
-
-        # 判断调度器是否存在并且在运行
-        if scheduler and hasattr(scheduler, "running") and scheduler.running:
-            logger.info("正在关闭运行中的调度器...")
-
-            # 尝试关闭调度器
-            try:
-                scheduler.shutdown(wait=False)
-                logger.info("调度器已成功关闭")
-            except Exception as shutdown_error:
-                logger.warning(f"关闭调度器时发生异常: {str(shutdown_error)}", exc_info=True)
-
-            # 释放调度器实例
-            app_state.set_scheduler(None)
-
-            # 更新调度器状态(非阻塞模式)
-            scheduler_status = {
-                "running": False,
-                "next_run_time": None,
-                "last_status": "调度器已停止",
-                "last_update_time": datetime.now()
-            }
-            app_state.update_scheduler_status(scheduler_status, blocking=False)
-            logger.info("已请求更新调度器状态为已停止")
-
-            success_msg = "调度器已成功停止"
-            logger.info(success_msg)
-            return success_msg
-        else:
-            info_msg = "调度器已经处于停止状态"
-            logger.info(info_msg)
-            return info_msg
-
-    except Exception as e:
-        error_msg = f"停止调度器时发生异常: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-
-        # 尝试更新错误状态
-        try:
-            app_state.update_scheduler_status({
-                "running": False,
-                "last_status": f"停止失败: {str(e)[:50]}",
-                "last_update_time": datetime.now(),
-                "error": str(e)
-            }, blocking=False)
-            logger.info(f"已请求更新调度器停止失败状态")
-        except Exception as status_error:
-            logger.error(f"无法更新调度器状态: {str(status_error)}", exc_info=True)
-
-        return error_msg
-
-
 # 立即执行一次推送任务
-async def run_push_task_once(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+async def run_push_task_once(llm_provider,
+                             llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key,
+                             research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
     """
     立即执行一次推送任务 (异步版本)
 
@@ -408,6 +315,8 @@ async def run_push_task_once(research_task, title_prefix="深度研究", search_
 
         # 调用异步的scheduled_job函数，指定为手动执行模式
         result, status_text, next_run_text = await scheduled_job(
+            llm_provider,
+            llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key,
             research_task,
             title_prefix,
             search_iterations,
@@ -432,7 +341,9 @@ async def run_push_task_once(research_task, title_prefix="深度研究", search_
         return error_msg, f"执行状态: 错误 ({str(e)[:50]})", "执行失败"
 
 
-async def execute_push_task(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3):
+async def execute_push_task(llm_provider,
+                            llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, research_task,
+                            title_prefix="深度研究", search_iterations=2, query_per_iter=3):
     """
     执行深度研究并将结果推送到钉钉
 
@@ -449,26 +360,17 @@ async def execute_push_task(research_task, title_prefix="深度研究", search_i
         start_time = datetime.now()
         logger.info(f"深度研究任务开始执行: {research_task}")
 
-        # 使用非阻塞方式更新调度器状态
-        scheduler_status = {
-            "last_run_time": start_time,
-            "last_status": "运行中"
-        }
-        # app_state.update_scheduler_status(scheduler_status, blocking=False)
-
-        # 创建代理状态
         agent_state = AgentState()
-        # 使用app_state替代agent_state调用clear_stop方法
         app_state.clear_stop()
 
         # 获取LLM模型 - 使用阿里云配置
         llm = utils.get_llm_model(
-            provider="alibaba",
-            model_name=os.getenv("ALIBABA_MODEL_NAME", "qwen-plus"),
-            num_ctx=int(os.getenv("ALIBABA_CTX_SIZE", "4096")),
-            temperature=float(os.getenv("ALIBABA_TEMPERATURE", "0.7")),
-            base_url=os.getenv("ALIBABA_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            api_key=os.getenv("ALIBABA_API_KEY", "sk-a144d606f37245d486e7ed61cd53c2fe"),
+            provider=llm_provider,
+            model_name=llm_model_name,
+            num_ctx=llm_num_ctx,
+            temperature=llm_temperature,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
         )
 
         # 执行深度研究
@@ -550,8 +452,9 @@ async def execute_push_task(research_task, title_prefix="深度研究", search_i
         return error_msg, None, None
 
 
-
-async def scheduled_job(research_task, title_prefix="深度研究", search_iterations=2, query_per_iter=3, is_manual=False):
+async def scheduled_job(llm_provider,
+                        llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, research_task,
+                        title_prefix="深度搜索", search_iterations=2, query_per_iter=3, is_manual=False):
     """
     定时任务入口函数 - 异步版本
 
@@ -585,6 +488,12 @@ async def scheduled_job(research_task, title_prefix="深度研究", search_itera
             # 使用asyncio.wait_for设置超时
             result, markdown_content, file_path = await asyncio.wait_for(
                 execute_push_task(
+                    llm_provider,
+                    llm_model_name,
+                    ollama_num_ctx,
+                    llm_temperature,
+                    llm_base_url,
+                    llm_api_key,
                     research_task,
                     title_prefix,
                     search_iterations,
@@ -1288,16 +1197,20 @@ async def optimize_prompt(prompt_text, llm_provider,
         保持用户的第一人称语气，直接返回扩展后的研究需求，不要添加任何解释。例如，当用户输入'我要一份牛奶分析报告'时，你应该将其扩展为'我需要一份全面的牛奶分析报告，希望从市场趋势、营养成分对比、消费者偏好和价格波动等角度进行深入研究。建议采用数据可视化方式呈现市场份额变化，并通过对比分析揭示不同品牌的优劣势。最终希望该报告能指导我的购买决策并提供未来牛奶行业发展趋势的洞察。'
 
         用户输入的是：'''
-        ai_query_msg = llm.invoke(prompt+prompt_text)
+        ai_query_msg = llm.invoke(prompt + prompt_text)
         return ai_query_msg.content
     except Exception as e:
         logger.error(f"Error optimizing prompt: {str(e)}")
         return f"优化失败: {str(e)}"
 
 
-async def run_deep_search(research_task, max_search_iteration_input, max_query_per_iter_input, llm_provider,
-                          llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
-                          use_own_browser, headless, chrome_cdp):
+async def run_deep_search(
+        enable_schedule,
+        schedule_interval,
+        schedule_title,
+        research_task, max_search_iteration_input, max_query_per_iter_input, llm_provider,
+        llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
+        use_own_browser, headless, chrome_cdp):
     from src.utils.deep_research import deep_research
     from src.utils.ppt_download import get_ppt
     import os
@@ -1315,26 +1228,223 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
         base_url=llm_base_url,
         api_key=llm_api_key,
     )
-    markdown_content, file_path = await deep_research(research_task, llm, _global_agent_state,
-                                                      max_search_iterations=max_search_iteration_input,
-                                                      max_query_num=max_query_per_iter_input,
-                                                      use_vision=use_vision,
-                                                      headless=headless,
-                                                      use_own_browser=use_own_browser,
-                                                      chrome_cdp=chrome_cdp
-                                                      )
 
-    # 生成PPT并返回文件路径
-    ppt_path = None
-    if file_path and os.path.exists(file_path) and markdown_content:
+    if enable_schedule:
+        scheduler = SchedulerManager()
+        # 使用关键字参数传递，避免位置参数问题
+
+        # 定义一个全局存储结果的字典
+        result_store = {}
+
+        # 定义回调函数来处理返回值
+        async def process_result(markdown_content, file_path):
+            # 存储结果
+            result_store['markdown_content'] = markdown_content
+            result_store['file_path'] = file_path
+
+            # 生成PPT
+            if file_path and os.path.exists(file_path) and markdown_content:
+                try:
+                    # 调用get_ppt函数生成PPT
+                    ppt_path = get_ppt(markdown_content)
+                    result_store['ppt_path'] = ppt_path
+
+                    # 记录日志
+                    logger.info(f"计划任务生成PPT成功: {ppt_path}")
+                except Exception as e:
+                    logger.error(f"计划任务生成PPT失败: {str(e)}")
+
+        # 自定义包装异步函数，确保参数正确传递
+        async def wrapped_deep_research():
+            result = await deep_research(
+                task=research_task,
+                llm=llm,
+                agent_state=_global_agent_state,
+                max_search_iterations=max_search_iteration_input,
+                max_query_num=max_query_per_iter_input,
+                use_vision=use_vision,
+                headless=headless,
+                use_own_browser=use_own_browser,
+                chrome_cdp=chrome_cdp
+            )
+            # 处理结果
+            if isinstance(result, tuple) and len(result) >= 2:
+                markdown_content, file_path = result[0], result[1]
+                await process_result(markdown_content, file_path)
+            return result
+
+        # 添加包装后的异步任务
+        async_job_id = scheduler.add_async_job(
+            async_func=wrapped_deep_research,
+            trigger='interval',
+            minutes=schedule_interval,  # 使用传入的间隔参数，转换为分钟
+            job_id=f"deep_research_{schedule_title}"  # 添加有意义的任务ID
+        )
+
+        # 立即执行一次任务
+        scheduler.execute_job_now(async_job_id)
+
+        # 轮询等待result_store有值，最多等待60秒
+        wait_time = 0
+        max_wait_time = 600  # 最大等待时间，秒
+        check_interval = 2   # 检查间隔，秒
+
+        logger.info(f"开始等待异步任务结果...")
+
+        # 初始化结果变量
+        markdown_content, file_path = None, None
+
+        # 轮询等待结果
+        while wait_time < max_wait_time:
+            # 检查result_store是否有值
+            if 'markdown_content' in result_store and 'file_path' in result_store:
+                markdown_content = result_store.get('markdown_content')
+                file_path = result_store.get('file_path')
+                logger.info(f"成功获取异步任务结果，耗时: {wait_time}秒")
+                break
+
+            # 等待一段时间再检查
+            await asyncio.sleep(check_interval)
+            wait_time += check_interval
+            logger.info(f"等待异步任务结果: {wait_time}秒...")
+
+        # 如果超时仍未获取结果
+        if wait_time >= max_wait_time:
+            logger.warning(f"等待异步任务结果超时({max_wait_time}秒)，继续处理")
+
+        # 返回结果，如果未获取到结果则为None
+        logger.info(f"返回结果: 文件路径={file_path}, 内容长度={len(markdown_content) if markdown_content else 0}")
+        if len(markdown_content) > 20000:  # 钉钉消息长度限制
+            markdown_content = markdown_content[:19700] + "\n\n...(内容已截断，完整内容请查看生成的文件)"
+
+        DingTalkRobot.send_markdown("Agent 推送报告", markdown_content)
+
+        return markdown_content, file_path, result_store.get('ppt_path'), gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+    else:
+        markdown_content, file_path = await deep_research(task=research_task,
+                                                          llm=llm,
+                                                          agent_state=_global_agent_state,
+                                                          max_search_iterations=max_search_iteration_input,
+                                                          max_query_num=max_query_per_iter_input,
+                                                          use_vision=use_vision,
+                                                          headless=headless,
+                                                          use_own_browser=use_own_browser,
+                                                          chrome_cdp=chrome_cdp
+                                                          )
+
+        # 生成PPT并返回文件路径
+        ppt_path = None
+        if file_path and os.path.exists(file_path) and markdown_content:
+            try:
+                # 调用get_ppt函数生成PPT
+                ppt_path = get_ppt(markdown_content)
+            except Exception as e:
+                logger.error(f"生成PPT失败: {str(e)}")
+        else:
+            # 计划模式的结果将在异步回调函数中处理
+            logger.info("计划任务已初始化，结果将在异步任务中处理")
+
+        if len(markdown_content) > 20000:  # 钉钉消息长度限制
+            markdown_content = markdown_content[:19700] + "\n\n...(内容已截断，完整内容请查看生成的文件)"
+
+        DingTalkRobot.send_markdown("Agent 推送报告", markdown_content)
+
+        return markdown_content, file_path, ppt_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+
+
+def get_next_run_time():
+    """
+    获取下一次定时任务执行时间
+
+    返回:
+        datetime: 下一次执行的时间点，如果没有调度任务则返回None
+    """
+    try:
+        # 获取当前调度器实例
+        scheduler = app_state.get_scheduler()
+        if not scheduler or not hasattr(scheduler, "running") or not scheduler.running:
+            return None
+
+        # 获取所有任务
+        jobs = scheduler.get_jobs()
+        if not jobs:
+            return None
+
+        # 找出下一个要执行的任务时间
+        next_run_time = None
+        for job in jobs:
+            if job.next_run_time:
+                if next_run_time is None or job.next_run_time < next_run_time:
+                    next_run_time = job.next_run_time
+
+        return next_run_time
+    except Exception as e:
+        logger.error(f"获取下一次执行时间异常: {str(e)}")
+        return None
+
+
+def stop_scheduler():
+    """
+    停止定时推送调度器
+
+    返回:
+        停止结果消息
+    """
+    try:
+        logger.info("尝试停止调度器...")
+
+        # 获取当前调度器实例
+        scheduler = app_state.get_scheduler()
+
+        # 判断调度器是否存在并且在运行
+        if scheduler and hasattr(scheduler, "running") and scheduler.running:
+            logger.info("正在关闭运行中的调度器...")
+
+            # 尝试关闭调度器
+            try:
+                scheduler.shutdown(wait=False)
+                logger.info("调度器已成功关闭")
+            except Exception as shutdown_error:
+                logger.warning(f"关闭调度器时发生异常: {str(shutdown_error)}", exc_info=True)
+
+            # 释放调度器实例
+            app_state.set_scheduler(None)
+
+            # 更新调度器状态(非阻塞模式)
+            scheduler_status = {
+                "running": False,
+                "next_run_time": None,
+                "last_status": "调度器已停止",
+                "last_update_time": datetime.now()
+            }
+            app_state.update_scheduler_status(scheduler_status, blocking=False)
+            logger.info("已请求更新调度器状态为已停止")
+
+            success_msg = "调度器已成功停止"
+            logger.info(success_msg)
+            return success_msg
+        else:
+            info_msg = "调度器已经处于停止状态"
+            logger.info(info_msg)
+            return info_msg
+
+    except Exception as e:
+        error_msg = f"停止调度器时发生异常: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+
+        # 尝试更新错误状态
         try:
-            # 调用get_ppt函数生成PPT
-            ppt_path = get_ppt(markdown_content)
-            logger.info(f"Generated PPT at: {ppt_path}")
-        except Exception as e:
-            logger.error(f"Error generating PPT: {str(e)}")
+            app_state.update_scheduler_status({
+                "running": False,
+                "last_status": f"停止失败: {str(e)[:50]}",
+                "last_update_time": datetime.now(),
+                "error": str(e)
+            }, blocking=False)
+            logger.info(f"已请求更新调度器停止失败状态")
+        except Exception as status_error:
+            logger.error(f"无法更新调度器状态: {str(status_error)}", exc_info=True)
 
-    return markdown_content, file_path, ppt_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+        return error_msg
 
 
 def create_ui(theme_name="Ocean"):
@@ -1633,6 +1743,34 @@ https://www.cifnews.com/ 雨果跨境
 
 结合上面新闻网站最新可能相关的新闻，生成相关类目的行业分析报告，结合用户的数据给用户提出一些建议，以及了解市场的方向趋势。""",
                                                  interactive=True)
+                # 添加定时推送设置区域
+                with gr.Accordion("⏰ 定时推送设置", open=False):
+                    with gr.Row():
+                        enable_schedule = gr.Checkbox(
+                            label="启用定时推送",
+                            value=False,
+                            info="启用后将按设定间隔自动执行任务",
+                            interactive=True
+                        )
+                    with gr.Row():
+                        with gr.Column():
+                            schedule_interval = gr.Slider(
+                                label="推送间隔（小时）",
+                                minimum=0.1,
+                                maximum=24,
+                                step=0.1,
+                                value=1,
+                                info="任务执行间隔时间，小数点表示小时分数",
+                                interactive=True
+                            )
+                        with gr.Column():
+                            schedule_title = gr.Textbox(
+                                label="推送标题前缀",
+                                value="深度搜索",
+                                info="消息标题前缀，将与任务内容拼接",
+                                interactive=True
+                            )
+
                 with gr.Row():
                     max_search_iteration_input = gr.Number(label="Max Search Iteration", value=3,
                                                            precision=0,
@@ -1644,7 +1782,9 @@ https://www.cifnews.com/ 雨果跨境
                     research_button = gr.Button("▶️ Run Deep Research", variant="primary", scale=2)
                     stop_research_button = gr.Button("⏹ Stop", variant="stop", scale=1)
                     task_opt_button = gr.Button("提示词美化", variant="stop", scale=1)
+
                 markdown_output_display = gr.Markdown(label="Research Report")
+                schedule_result_text = gr.Markdown("定时任务状态将在此显示...")
                 # Markdown和PPT下载部分
                 with gr.Row():
                     markdown_download = gr.File(label="下载Markdown报告", interactive=False)
@@ -1700,10 +1840,15 @@ https://www.cifnews.com/ 雨果跨境
             # Run Deep Research
             research_button.click(
                 fn=run_deep_search,
-                inputs=[research_task_input, max_search_iteration_input, max_query_per_iter_input, llm_provider,
-                        llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
-                        use_own_browser, headless, chrome_cdp],
-                outputs=[markdown_output_display, markdown_download, ppt_download, stop_research_button, research_button]
+                inputs=[
+                    enable_schedule,
+                    schedule_interval,
+                    schedule_title,
+                    research_task_input, max_search_iteration_input, max_query_per_iter_input, llm_provider,
+                    llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, use_vision,
+                    use_own_browser, headless, chrome_cdp],
+                outputs=[markdown_output_display, markdown_download, ppt_download, stop_research_button,
+                         research_button]
             )
 
             # Bind the stop button click event
@@ -1716,11 +1861,11 @@ https://www.cifnews.com/ 雨果跨境
             # Connect the task_opt_button to the optimize_prompt function
             task_opt_button.click(
                 fn=optimize_prompt,
-                inputs=[research_task_input,llm_provider,
+                inputs=[research_task_input, llm_provider,
                         llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key],
                 outputs=[research_task_input]
             )
-            
+
             # 添加定时推送设置标签页
             (
                 scheduler_enabled, scheduler_interval, scheduler_task, scheduler_title,
@@ -1728,16 +1873,22 @@ https://www.cifnews.com/ 雨果跨境
                 scheduler_next_run_text, scheduler_start_btn, scheduler_stop_btn,
                 scheduler_run_once_btn, scheduler_result_text
             ) = create_scheduler_tab()
-            
+
             # 绑定定时推送标签页的事件处理
             # 创建一个辅助函数来转换小时到分钟
-            def convert_hours_to_minutes(hours, task, title, iterations, queries):
+            def convert_hours_to_minutes(llm_provider,
+                                         llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key,
+                                         hours, task, title, iterations, queries):
                 minutes = int(float(hours) * 60)  # 将小时转换为分钟
-                return start_scheduler(task, minutes, title, iterations, queries)
-                
+                return start_scheduler(llm_provider,
+                                       llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key, task,
+                                       minutes, title, iterations, queries)
+
             scheduler_start_btn.click(
                 fn=convert_hours_to_minutes,
                 inputs=[
+                    llm_provider,
+                    llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key,
                     scheduler_interval,
                     scheduler_task,
                     scheduler_title,
@@ -1746,16 +1897,18 @@ https://www.cifnews.com/ 雨果跨境
                 ],
                 outputs=[scheduler_result_text]
             )
-            
+
             scheduler_stop_btn.click(
                 fn=stop_scheduler,
                 inputs=[],
                 outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
             )
-            
+
             scheduler_run_once_btn.click(
                 fn=run_push_task_once,
                 inputs=[
+                    llm_provider,
+                    llm_model_name, ollama_num_ctx, llm_temperature, llm_base_url, llm_api_key,
                     scheduler_task,
                     scheduler_title,
                     scheduler_iterations,
@@ -1763,7 +1916,6 @@ https://www.cifnews.com/ 雨果跨境
                 ],
                 outputs=[scheduler_result_text, scheduler_status_text, scheduler_next_run_text]
             )
-
             with gr.TabItem("🎥 Recordings", id=7, visible=True):
                 def list_recordings(save_recording_path):
                     if not os.path.exists(save_recording_path):
